@@ -14,7 +14,7 @@ URL_RESULTADOS = "https://www.quini-6-resultados.com.ar/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------a----------------------------------
 # Jugadas hardcodeadas
 # ---------------------------------------------------------------------------
 JUGADAS = {
@@ -46,10 +46,25 @@ def obtener_resultados():
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     }
-    session = requests.Session()
-    resp = session.get(URL_RESULTADOS, headers=headers, timeout=20)
-    resp.raise_for_status()
-    texto = resp.text
+
+    texto = None
+
+    # Intento 1: pedido directo
+    try:
+        session = requests.Session()
+        resp = session.get(URL_RESULTADOS, headers=headers, timeout=20)
+        resp.raise_for_status()
+        texto = resp.text
+    except requests.exceptions.HTTPError as e:
+        print(f"Pedido directo falló ({e}), probando vía proxy de lectura...", file=sys.stderr)
+
+    # Intento 2 (fallback): vía r.jina.ai, que hace de intermediario y suele
+    # esquivar bloqueos de IP tipo Cloudflare contra servidores de CI/CD
+    if texto is None:
+        proxy_url = f"https://r.jina.ai/{URL_RESULTADOS}"
+        resp = requests.get(proxy_url, timeout=30)
+        resp.raise_for_status()
+        texto = resp.text
 
     # Fecha y número de sorteo, ej: "Sorteo del dia 02/09/2026 Nro. Sorteo: 3405"
     m_sorteo = re.search(
