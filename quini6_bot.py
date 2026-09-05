@@ -14,7 +14,7 @@ URL_RESULTADOS = "https://www.quini-6-resultados.com.ar/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# -----------------------------------------a----------------------------------
+# ---------------------------------------------------------------------------
 # Jugadas hardcodeadas
 # ---------------------------------------------------------------------------
 JUGADAS = {
@@ -26,6 +26,25 @@ JUGADAS = {
 # de números de cada jugada (Tradicional / La Segunda / Revancha / Siempre Sale
 # usan la misma boleta, cada una con su propio sorteo de 6 números).
 MODALIDADES = ["Tradicional", "La Segunda", "Revancha", "Siempre Sale"]
+
+# Mínimo de aciertos necesarios para ganar algún premio en cada modalidad.
+# Revancha solo paga con 6 aciertos. Tradicional/La Segunda/Siempre Sale
+# pagan desde 4 aciertos en adelante (Siempre Sale es una aproximación,
+# ya que en la realidad el pozo puede bajar de nivel según haya o no
+# ganadores, y eso no se puede saber sin scrapear la tabla de premios).
+MINIMO_PARA_GANAR = {
+    "Tradicional": 4,
+    "La Segunda": 4,
+    "Revancha": 6,
+    "Siempre Sale": 4,
+}
+MINIMO_PARA_GANAR_POZO_EXTRA = 6
+
+# Si en "Siempre Sale" das exactamente este número de aciertos, no se puede
+# saber con la info que scrapeamos si ganaste o no (depende de si el pozo
+# bajó hasta ese nivel ese sorteo puntual) -> se avisa para verificar a mano.
+ACIERTOS_SIEMPRE_SALE_A_VERIFICAR = 3
+URL_CONTROLAR_BOLETA = "https://www.quini-6-resultados.com.ar/quini6/controlar-boleta.aspx"
 
 
 def obtener_resultados():
@@ -119,6 +138,8 @@ def formatear_mensaje(resultados):
     lineas.append("")
 
     hubo_algun_acierto = False
+    ganadoras = []  # lista de (nombre_jugada, modalidad, cantidad_aciertos)
+    a_verificar = []  # lista de (nombre_jugada, cantidad_aciertos) en Siempre Sale con 3 aciertos
 
     for nombre_jugada, numeros_jugada in JUGADAS.items():
         lineas.append(f"<b>{nombre_jugada}:</b> {' - '.join(f'{n:02d}' for n in numeros_jugada)}")
@@ -129,6 +150,10 @@ def formatear_mensaje(resultados):
                 hubo_algun_acierto = True
                 aciertos_str = ", ".join(f"{n:02d}" for n in aciertos)
                 lineas.append(f"  ✅ {modalidad}: {len(aciertos)} aciertos ({aciertos_str})")
+                if len(aciertos) >= MINIMO_PARA_GANAR[modalidad]:
+                    ganadoras.append((nombre_jugada, modalidad, len(aciertos)))
+                elif modalidad == "Siempre Sale" and len(aciertos) == ACIERTOS_SIEMPRE_SALE_A_VERIFICAR:
+                    a_verificar.append((nombre_jugada, len(aciertos)))
             else:
                 lineas.append(f"  ➖ {modalidad}: sin aciertos")
 
@@ -137,6 +162,8 @@ def formatear_mensaje(resultados):
             hubo_algun_acierto = True
             aciertos_str = ", ".join(f"{n:02d}" for n in aciertos_extra)
             lineas.append(f"  ✅ Pozo Extra: {len(aciertos_extra)} aciertos ({aciertos_str})")
+            if len(aciertos_extra) >= MINIMO_PARA_GANAR_POZO_EXTRA:
+                ganadoras.append((nombre_jugada, "Pozo Extra", len(aciertos_extra)))
         else:
             lineas.append("  ➖ Pozo Extra: sin aciertos")
 
@@ -144,6 +171,22 @@ def formatear_mensaje(resultados):
 
     if not hubo_algun_acierto:
         lineas.append("😕 No hubo aciertos en ninguna jugada ni modalidad.")
+
+    # --- Resumen final: ¿ganaste o no? ---
+    lineas.append("—" * 20)
+    if ganadoras:
+        lineas.append("🎉🥳 <b>¡GANASTE!</b> 🎆🎺")
+        for nombre_jugada, modalidad, cantidad in ganadoras:
+            lineas.append(f"   🏆 {nombre_jugada} - {modalidad} ({cantidad} aciertos)")
+    else:
+        lineas.append("😢😭 <b>No ganaste esta vez.</b>")
+
+    for nombre_jugada, cantidad in a_verificar:
+        lineas.append("")
+        lineas.append(
+            f"Revisa si ganaste en {URL_CONTROLAR_BOLETA}, "
+            f"tenes {cantidad} aciertos en Siempre Sale ({nombre_jugada})."
+        )
 
     return "\n".join(lineas)
 
