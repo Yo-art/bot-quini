@@ -35,8 +35,19 @@ def obtener_resultados():
     - los 6 números de cada una de las 4 modalidades
     Devuelve un dict: {"fecha": str, "nro_sorteo": str, "Tradicional": [..], ...}
     """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; Quini6Bot/1.0)"}
-    resp = requests.get(URL_RESULTADOS, headers=headers, timeout=20)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    session = requests.Session()
+    resp = session.get(URL_RESULTADOS, headers=headers, timeout=20)
     resp.raise_for_status()
     texto = resp.text
 
