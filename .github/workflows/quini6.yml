@@ -2,8 +2,8 @@ name: Control Quini 6
 
 on:
   schedule:
-    # Lunes y jueves a las 12:00 UTC = 09:00 hora Argentina (UTC-3)
-    - cron: "0 12 * * 1,4"
+    # Lunes y jueves a las 13:00 UTC = 10:00 hora Argentina (UTC-3)
+    - cron: "0 13 * * 1,4"
   workflow_dispatch: {}  # permite ejecutarlo manualmente para probar
 
 jobs:
