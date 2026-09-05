@@ -1,28 +1,229 @@
-name: Control Quini 6
+"""
+Bot de control de Quini 6.
+Scrapea el último sorteo desde quini-6-resultados.com.ar,
+compara contra las jugadas hardcodeadas y avisa por Telegram.
+"""
 
-on:
-  schedule:
-    # Lunes y jueves a las 12:00 UTC = 09:00 hora Argentina (UTC-3)
-    - cron: "0 12 * * 1,4"
-  workflow_dispatch: {}  # permite ejecutarlo manualmente para probar
+import os
+import re
+import sys
+import requests
 
-jobs:
-  controlar-quini6:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+URL_RESULTADOS = "https://www.quini-6-resultados.com.ar/"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-      - name: Instalar dependencias
-        run: pip install requests
+# ---------------------------------------------------------------------------
+# Jugadas hardcodeadas
+# ---------------------------------------------------------------------------
+JUGADAS = {
+    "Jugada 1": [7, 9, 15, 32, 36, 40],
+    "Jugada 2": [8, 14, 21, 27, 32, 35],
+}
 
-      - name: Ejecutar bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python quini6_bot.py
+# Modalidades que se juegan. Cada una se controla contra el mismo conjunto
+# de números de cada jugada (Tradicional / La Segunda / Revancha / Siempre Sale
+# usan la misma boleta, cada una con su propio sorteo de 6 números).
+MODALIDADES = ["Tradicional", "La Segunda", "Revancha", "Siempre Sale"]
+
+# Mínimo de aciertos necesarios para ganar algún premio en cada modalidad.
+# Revancha solo paga con 6 aciertos. Tradicional/La Segunda/Siempre Sale
+# pagan desde 4 aciertos en adelante (Siempre Sale es una aproximación,
+# ya que en la realidad el pozo puede bajar de nivel según haya o no
+# ganadores, y eso no se puede saber sin scrapear la tabla de premios).
+MINIMO_PARA_GANAR = {
+    "Tradicional": 4,
+    "La Segunda": 4,
+    "Revancha": 6,
+    "Siempre Sale": 4,
+}
+MINIMO_PARA_GANAR_POZO_EXTRA = 6
+
+# Si en "Siempre Sale" das exactamente este número de aciertos, no se puede
+# saber con la info que scrapeamos si ganaste o no (depende de si el pozo
+# bajó hasta ese nivel ese sorteo puntual) -> se avisa para verificar a mano.
+ACIERTOS_SIEMPRE_SALE_A_VERIFICAR = 3
+URL_CONTROLAR_BOLETA = "https://www.quini-6-resultados.com.ar/quini6/controlar-boleta.aspx"
+
+
+def obtener_resultados():
+    """
+    Descarga la home de quini-6-resultados.com.ar y extrae:
+    - fecha y número del último sorteo
+    - los 6 números de cada una de las 4 modalidades
+    Devuelve un dict: {"fecha": str, "nro_sorteo": str, "Tradicional": [..], ...}
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    texto = None
+
+    # Intento 1: pedido directo
+    try:
+        session = requests.Session()
+        resp = session.get(URL_RESULTADOS, headers=headers, timeout=20)
+        resp.raise_for_status()
+        texto = resp.text
+    except requests.exceptions.HTTPError as e:
+        print(f"Pedido directo falló ({e}), probando vía proxy de lectura...", file=sys.stderr)
+
+    # Intento 2 (fallback): vía r.jina.ai, que hace de intermediario y suele
+    # esquivar bloqueos de IP tipo Cloudflare contra servidores de CI/CD
+    if texto is None:
+        proxy_url = f"https://r.jina.ai/{URL_RESULTADOS}"
+        resp = requests.get(proxy_url, timeout=30)
+        resp.raise_for_status()
+        texto = resp.text
+
+    # Fecha y número de sorteo, ej: "Sorteo del dia 02/09/2026 Nro. Sorteo: 3405"
+    m_sorteo = re.search(
+        r"Sorteo del d[ií]a\s*(\d{2}/\d{2}/\d{4}).*?Nro\.?\s*Sorteo:?\s*(\d+)",
+        texto,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m_sorteo:
+        raise RuntimeError("No se pudo encontrar la fecha/número de sorteo en la página")
+
+    fecha = m_sorteo.group(1)
+    nro_sorteo = m_sorteo.group(2)
+
+    # A partir de la posición del bloque de sorteo, buscamos las 4 tandas de
+    # 6 números de dos dígitos separados por guiones, en orden:
+    # TRADICIONAL, LA SEGUNDA, REVANCHA, SIEMPRE SALE
+    bloque = texto[m_sorteo.start():]
+    patron_numeros = re.compile(r"(\d{2}(?:\s*-\s*\d{2}){5})")
+    encontrados = patron_numeros.findall(bloque)
+
+    if len(encontrados) < 4:
+        raise RuntimeError(
+            f"Se esperaban 4 grupos de números y se encontraron {len(encontrados)}"
+        )
+
+    resultado = {"fecha": fecha, "nro_sorteo": nro_sorteo}
+    for modalidad, grupo in zip(MODALIDADES, encontrados[:4]):
+        numeros = [int(n) for n in re.findall(r"\d{2}", grupo)]
+        resultado[modalidad] = numeros
+
+    return resultado
+
+
+def calcular_aciertos(jugada, numeros_sorteo):
+    """Devuelve la lista de números acertados entre una jugada y un sorteo."""
+    return sorted(set(jugada) & set(numeros_sorteo))
+
+
+def calcular_pozo_extra(jugada, resultados):
+    """
+    El Pozo Extra se gana con 6 aciertos contando los tres primeros sorteos
+    (Tradicional + La Segunda + Revancha), contando los números repetidos
+    una sola vez.
+    """
+    combinado = set(resultados["Tradicional"]) | set(resultados["La Segunda"]) | set(resultados["Revancha"])
+    return calcular_aciertos(jugada, combinado)
+
+
+def formatear_mensaje(resultados):
+    lineas = []
+    lineas.append(f"🎰 <b>Quini 6 - Sorteo {resultados['nro_sorteo']}</b> ({resultados['fecha']})")
+    lineas.append("")
+
+    hubo_algun_acierto = False
+    ganadoras = []  # lista de (nombre_jugada, modalidad, cantidad_aciertos)
+    a_verificar = []  # lista de (nombre_jugada, cantidad_aciertos) en Siempre Sale con 3 aciertos
+
+    for nombre_jugada, numeros_jugada in JUGADAS.items():
+        lineas.append(f"<b>{nombre_jugada}:</b> {' - '.join(f'{n:02d}' for n in numeros_jugada)}")
+
+        for modalidad in MODALIDADES:
+            aciertos = calcular_aciertos(numeros_jugada, resultados[modalidad])
+            if aciertos:
+                hubo_algun_acierto = True
+                aciertos_str = ", ".join(f"{n:02d}" for n in aciertos)
+                lineas.append(f"  ✅ {modalidad}: {len(aciertos)} aciertos ({aciertos_str})")
+                if len(aciertos) >= MINIMO_PARA_GANAR[modalidad]:
+                    ganadoras.append((nombre_jugada, modalidad, len(aciertos)))
+                elif modalidad == "Siempre Sale" and len(aciertos) == ACIERTOS_SIEMPRE_SALE_A_VERIFICAR:
+                    a_verificar.append((nombre_jugada, len(aciertos)))
+            else:
+                lineas.append(f"  ➖ {modalidad}: sin aciertos")
+
+        aciertos_extra = calcular_pozo_extra(numeros_jugada, resultados)
+        if aciertos_extra:
+            hubo_algun_acierto = True
+            aciertos_str = ", ".join(f"{n:02d}" for n in aciertos_extra)
+            lineas.append(f"  ✅ Pozo Extra: {len(aciertos_extra)} aciertos ({aciertos_str})")
+            if len(aciertos_extra) >= MINIMO_PARA_GANAR_POZO_EXTRA:
+                ganadoras.append((nombre_jugada, "Pozo Extra", len(aciertos_extra)))
+        else:
+            lineas.append("  ➖ Pozo Extra: sin aciertos")
+
+        lineas.append("")
+
+    if not hubo_algun_acierto:
+        lineas.append("😕 No hubo aciertos en ninguna jugada ni modalidad.")
+
+    # --- Resumen final: ¿ganaste o no? ---
+    lineas.append("—" * 20)
+    if ganadoras:
+        lineas.append("🎉🥳 <b>¡GANASTE!</b> 🎆🎺")
+        for nombre_jugada, modalidad, cantidad in ganadoras:
+            lineas.append(f"   🏆 {nombre_jugada} - {modalidad} ({cantidad} aciertos)")
+    else:
+        lineas.append("😢😭 <b>No ganaste esta vez.</b>")
+
+    for nombre_jugada, cantidad in a_verificar:
+        lineas.append("")
+        lineas.append(
+            f"Revisa si ganaste en {URL_CONTROLAR_BOLETA}, "
+            f"tenes {cantidad} aciertos en Siempre Sale ({nombre_jugada})."
+        )
+
+    return "\n".join(lineas)
+
+
+def enviar_telegram(mensaje):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en las variables de entorno")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": mensaje,
+            "parse_mode": "HTML",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def main():
+    try:
+        resultados = obtener_resultados()
+    except Exception as e:
+        print(f"Error obteniendo resultados: {e}", file=sys.stderr)
+        # Avisamos por Telegram si algo se rompió, para no quedarnos en silencio
+        try:
+            enviar_telegram(f"⚠️ Error al controlar el Quini 6: {e}")
+        except Exception:
+            pass
+        sys.exit(1)
+
+    mensaje = formatear_mensaje(resultados)
+    print(mensaje)
+    enviar_telegram(mensaje)
+
+
+if __name__ == "__main__":
+    main()
